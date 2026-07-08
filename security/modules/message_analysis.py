@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import typing
 from collections import defaultdict
 from pathlib import Path
@@ -12,7 +13,8 @@ from redbot.core import commands
 from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import box, humanize_list
-from security.constants import Emojis, get_correct_timeout_duration
+from security.constants import Emojis
+from security.utils import get_correct_timeout_duration
 from security.views import DurationConverter, SettingsView, ToggleModuleButton
 
 from .module import Module
@@ -21,8 +23,9 @@ _: Translator = Translator("Security", __file__)
 
 
 LEVELS: dict[str, float] = {
+    # "toxicity": 0.75,
     "severe_toxicity": 0.15,
-    "obscene": 0.75,
+    # "obscene": 0.75,
     "identity_attack": 0.25,
     "insult": 0.90,
     "threat": 0.50,
@@ -314,12 +317,12 @@ class MessageAnalysisModule(Module):
                 row=2 + (i // 5),
             )
 
-            async def level_button_callback(interaction: discord.Interaction) -> None:
+            async def level_button_callback(level: str, interaction: discord.Interaction) -> None:
                 await interaction.response.send_modal(
                     ConfigureLevelModal(self, guild, view, level, config["levels"][level]),
                 )
 
-            level_button.callback = level_button_callback
+            level_button.callback = functools.partial(level_button_callback, level)
             components.append(level_button)
 
         if view.ctx.author.id in self.cog.bot.owner_ids:
@@ -368,66 +371,62 @@ class MessageAnalysisModule(Module):
             return
         if not message.content:
             return
-        lock = self.locks[message.guild][message.author]
-        await lock.acquire()
-        if self.strikes_cache[message.guild][message.author] > number:
+        async with self.locks[message.guild][message.author]:
+            if self.strikes_cache[message.guild][message.author] > number:
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass
+                return
+            result = await self.predict(message.content)
+            if not any(result[key] >= config["levels"][key] for key in LEVELS):
+                return
             try:
                 await message.delete()
             except discord.HTTPException:
                 pass
-            lock.release()
-            return
-        result = await self.predict(message.content)
-        if not any(result[key] >= config["levels"][key] for key in LEVELS):
-            lock.release()
-            return
-        try:
-            await message.delete()
-        except discord.HTTPException:
-            pass
-        reason = _("**Message Analysis** - Message detected as potentially harmful.")
-        reason += box(
-            "\n{\n"
-            + "\n".join(
-                f"  {key}: {value:.3f},{'  # ⚠️' if value >= config['levels'][key] else ''}"
-                for key, value in result.items()
+            reason = _("**Message Analysis** - Message detected as potentially harmful.")
+            reason += box(
+                "\n{\n"
+                + "\n".join(
+                    f"  {key}: {value:.3f},{'  # ⚠️' if key in LEVELS and value >= config['levels'][key] else ''}"
+                    for key, value in result.items()
+                )
+                + "\n}",
+                lang="py",
             )
-            + "\n}",
-            lang="py",
-        )
-        if config["timeout"]:
-            audit_log_reason = (
-                "Security's Message Analysis: message detected as potentially harmful."
-            )
-            duration = await DurationConverter.convert(
-                None,
-                config["duration"],
-            )
-            self.strikes_cache[message.guild][message.author] += 1
-            if config["increase_duration"]:
-                duration *= self.strikes_cache[message.guild][message.author]
-            duration = get_correct_timeout_duration(message.author, duration)
-            if message.guild.me.guild_permissions.moderate_members:
-                await message.author.timeout(duration, reason=audit_log_reason)
-            await self.cog.send_modlog(
-                action="timeout",
-                member=message.author,
-                reason=reason,
-                duration=duration,
-                trigger_messages=[message],
-                context_message=message,
-                current_ctx=message,
-            )
-        else:
-            await self.cog.send_modlog(
-                action="notify",
-                member=message.author,
-                reason=reason,
-                trigger_messages=[message],
-                context_message=message,
-                current_ctx=message,
-            )
-        lock.release()
+            if config["timeout"]:
+                audit_log_reason = (
+                    "Security's Message Analysis: message detected as potentially harmful."
+                )
+                duration = await DurationConverter.convert(
+                    None,
+                    config["duration"],
+                )
+                self.strikes_cache[message.guild][message.author] += 1
+                if config["increase_duration"]:
+                    duration *= self.strikes_cache[message.guild][message.author]
+                duration = get_correct_timeout_duration(message.author, duration)
+                if message.guild.me.guild_permissions.moderate_members:
+                    await message.author.timeout(duration, reason=audit_log_reason)
+                await self.cog.send_modlog(
+                    action="timeout",
+                    member=message.author,
+                    reason=reason,
+                    duration=duration,
+                    trigger_messages=[message],
+                    context_message=message,
+                    current_ctx=message,
+                )
+            else:
+                await self.cog.send_modlog(
+                    action="notify",
+                    member=message.author,
+                    reason=reason,
+                    trigger_messages=[message],
+                    context_message=message,
+                    current_ctx=message,
+                )
 
 
 class ConfigureDurationModal(discord.ui.Modal):
@@ -446,7 +445,7 @@ class ConfigureDurationModal(discord.ui.Modal):
         self.duration_input: discord.ui.TextInput = discord.ui.TextInput(
             label=_("Duration:"),
             style=discord.TextStyle.short,
-            default=str(duration),
+            default=duration,
             required=True,
         )
         self.add_item(self.duration_input)
@@ -502,6 +501,5 @@ class ConfigureLevelModal(discord.ui.Modal):
                 ephemeral=True,
             )
             return
-        self.value = value
-        await self.module.config_value(self.guild).levels.set({**self.levels, self.level: value})
+        await self.module.config_value(self.guild).levels.set_raw(self.level, value=value)
         await self.view.edit_message()

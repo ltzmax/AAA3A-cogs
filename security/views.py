@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import functools
 import typing
+from io import BytesIO
 
 import discord
 from dictdiffer import diff
@@ -18,8 +19,11 @@ from .constants import (
     Colors,
     Emojis,
     Levels,
+)
+from .utils import (
     get_correct_timeout_duration,
     get_health_grade,
+    get_next_monday_timestamp,
     get_non_animated_asset,
 )
 
@@ -361,7 +365,7 @@ class SettingsView(discord.ui.View):
         self.page: str = "overview"
         self._message: discord.Message = None
         self.last_state: dict = {}
-        self.health_score_file: discord.File | None = None
+        self.img_file: discord.File | None = None
 
         self.reset_recovery_key.label = _("Reset Recovery Key")
         self.create_quarantine_role.label = _("Create Quarantine Role")
@@ -371,6 +375,7 @@ class SettingsView(discord.ui.View):
         self.modlog_ping_role_select.placeholder = _("Select Modlog Ping Role")
         self.extra_owners_select.placeholder = _("Manage Extra Owners")
         self.trusted_admins_select.placeholder = _("Manage Trusted Admins")
+        self.toggle_allow_bot_owners.label = _("Allow Bot Owners")
         self.show_logs.label = _("Show Logs")
 
     async def start(self, ctx: commands.Context, page: str = "overview") -> discord.Message:
@@ -413,7 +418,7 @@ class SettingsView(discord.ui.View):
         self._message: discord.Message = await self.ctx.send(
             embed=await self.get_embed(),
             view=self,
-            file=self.health_score_file,
+            file=self.img_file,
         )
         self.cog.views[self._message] = self
         return self._message
@@ -425,7 +430,7 @@ class SettingsView(discord.ui.View):
             await self._message.edit(
                 embed=embed,
                 view=self,
-                attachments=[self.health_score_file] if self.health_score_file else [],
+                attachments=[self.img_file] if self.img_file else [],
             )
         except discord.HTTPException:
             pass
@@ -466,7 +471,7 @@ class SettingsView(discord.ui.View):
             )
             await self.cog.config.guild(self.ctx.guild).logs.set(logs)
         self.last_state = new_state
-        self.health_score_file = None
+        self.img_file = None
 
         embed: discord.Embed = discord.Embed(
             timestamp=self.ctx.message.created_at,
@@ -573,8 +578,8 @@ class SettingsView(discord.ui.View):
                     inline=True,
                 )
             score = (await self.cog.get_health_score(self.ctx.guild))[0]
-            self.health_score_file = self.cog.get_health_score_file(score, get_health_grade(score))
-            embed.set_image(url=f"attachment://{self.health_score_file.filename}")
+            self.img_file = self.cog.get_health_score_file(score, get_health_grade(score))
+            embed.set_image(url=f"attachment://{self.img_file.filename}")
         elif self.page == "authority_members":
             embed.title = _("Security — Authority Members")
             embed.description = _(
@@ -620,10 +625,58 @@ class SettingsView(discord.ui.View):
                 + _("⚙️ *They can change **most settings** of Security.*"),
                 inline=False,
             )
-            if await self.cog.is_owner_or_higher(self.ctx.author):
+            weekly_digest_config = await self.cog.config.guild(self.ctx.guild).all()
+            weekly_digest_enabled = weekly_digest_config["weekly_digest_enabled"]
+            next_timestamp = (
+                weekly_digest_config["weekly_digest_next_timestamp"] or get_next_monday_timestamp()
+            )
+            embed.add_field(
+                name=_("Weekly Digest:"),
+                value=_(
+                    "{status} A weekly summary of the moderation activity (auto mod actions, quarantines, reports, etc.) is posted in the modlog channel.",
+                ).format(status="✅" if weekly_digest_enabled else "❌")
+                + (
+                    _("\n🕒 **Next Digest:** {next_digest}").format(
+                        next_digest=discord.utils.format_dt(
+                            datetime.datetime.fromtimestamp(
+                                next_timestamp,
+                                tz=datetime.timezone.utc,
+                            ),
+                            style="F",
+                        ),
+                    )
+                    if weekly_digest_enabled
+                    else ""
+                ),
+                inline=False,
+            )
+            allow_bot_owners = weekly_digest_config["allow_bot_owners"]
+            embed.add_field(
+                name=_("Allow Bot Owners:"),
+                value=_(
+                    "{status} Bot owners are treated as **Extra Owners** and are **100% immune** to Security.",
+                ).format(status="✅" if allow_bot_owners else "❌"),
+                inline=False,
+            )
+            self.toggle_weekly_digest.label = (
+                _("Weekly Digest") if weekly_digest_enabled else _("Weekly Digest")
+            )
+            self.toggle_weekly_digest.style = (
+                discord.ButtonStyle.danger if weekly_digest_enabled else discord.ButtonStyle.success
+            )
+            self.toggle_allow_bot_owners.style = (
+                discord.ButtonStyle.danger if allow_bot_owners else discord.ButtonStyle.success
+            )
+            is_owner_or_higher = await self.cog.is_owner_or_higher(self.ctx.author)
+            is_extra_owner_or_higher = await self.cog.is_extra_owner_or_higher(self.ctx.author)
+            if is_owner_or_higher:
                 self.add_item(self.extra_owners_select)
-            if await self.cog.is_extra_owner_or_higher(self.ctx.author):
+            if is_extra_owner_or_higher:
                 self.add_item(self.trusted_admins_select)
+            if is_owner_or_higher:
+                self.add_item(self.toggle_allow_bot_owners)
+            if is_extra_owner_or_higher:
+                self.add_item(self.toggle_weekly_digest)
             self.add_item(self.show_logs)
         else:
             module = self.cog.modules[self.page]
@@ -648,6 +701,13 @@ class SettingsView(discord.ui.View):
                 ):
                     continue
                 self.add_item(component)
+            if module.key_name() == "verification":
+                __, captcha_img = await asyncio.to_thread(module.generate_captcha)
+                buffer = BytesIO()
+                captcha_img.save(buffer, format="PNG")
+                buffer.seek(0)
+                self.img_file = discord.File(buffer, filename="captcha.png")
+                embed.set_image(url=f"attachment://{self.img_file.filename}")
         return embed
 
     @discord.ui.select(min_values=1, max_values=1)
@@ -657,7 +717,7 @@ class SettingsView(discord.ui.View):
         await interaction.response.edit_message(
             embed=embed,
             view=self,
-            attachments=[self.health_score_file] if self.health_score_file else [],
+            attachments=[self.img_file] if self.img_file else [],
         )
 
     @discord.ui.button(emoji="🔑", label="Reset Recovery Key", style=discord.ButtonStyle.primary)
@@ -1038,6 +1098,53 @@ class SettingsView(discord.ui.View):
         )()
         await Menu(pages=embeds, page_start=-1, ephemeral=True).start(fake_context)
 
+    @discord.ui.button(
+        emoji=Emojis.WEEKLY_DIGEST.value,
+        label="Weekly Digest",
+        style=discord.ButtonStyle.success,
+    )
+    async def toggle_weekly_digest(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        enabled = not await self.cog.config.guild(self.ctx.guild).weekly_digest_enabled()
+        await self.cog.config.guild(self.ctx.guild).weekly_digest_enabled.set(enabled)
+        next_timestamp = await self.cog.config.guild(self.ctx.guild).weekly_digest_next_timestamp()
+        if enabled and next_timestamp is None:
+            await self.cog.config.guild(self.ctx.guild).weekly_digest_next_timestamp.set(
+                get_next_monday_timestamp(),
+            )
+        await interaction.followup.send(
+            _("✅ Weekly Digest has been **{status}**.").format(
+                status=_("enabled") if enabled else _("disabled"),
+            ),
+            ephemeral=True,
+        )
+        await self.edit_message()
+
+    @discord.ui.button(
+        emoji="👑",
+        label="Allow Bot Owners",
+        style=discord.ButtonStyle.success,
+    )
+    async def toggle_allow_bot_owners(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        enabled = not await self.cog.config.guild(self.ctx.guild).allow_bot_owners()
+        await self.cog.config.guild(self.ctx.guild).allow_bot_owners.set(enabled)
+        await interaction.followup.send(
+            _("✅ Bot owners being treated as Extra Owners has been **{status}**.").format(
+                status=_("enabled") if enabled else _("disabled"),
+            ),
+            ephemeral=True,
+        )
+        await self.edit_message()
+
 
 class ToggleModuleButton(discord.ui.Button):
     def __init__(self, module, guild: discord.Guild, view: SettingsView, enabled: bool) -> None:
@@ -1149,11 +1256,11 @@ class ActionsView(discord.ui.View):
                     style=discord.ButtonStyle.secondary,
                     disabled=(
                         not getattr(self.member.guild.me.guild_permissions, action["permission"])
-                        and (
-                            action["value"] != "timeout"
-                            or not self.member.guild_permissions.administrator
+                        or (
+                            action["value"] == "timeout"
+                            and self.member.guild_permissions.administrator
                         )
-                        and (action["value"] != "mute" or mute_check)
+                        or (action["value"] == "mute" and not mute_check)
                     ),
                 )
                 button.callback = functools.partial(self.action_callback, action=action)

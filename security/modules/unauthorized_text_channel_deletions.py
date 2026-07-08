@@ -7,7 +7,8 @@ import discord
 
 from redbot.core import commands
 from redbot.core.i18n import Translator
-from security.constants import Colors, Emojis, Levels, get_non_animated_asset
+from security.constants import Colors, Emojis, Levels
+from security.utils import get_non_animated_asset
 from security.views import SettingsView, ToggleModuleButton
 
 from .module import Module
@@ -86,6 +87,20 @@ class UnauthorizedTextChannelDeletionsModule(Module):
                 "value": "✅" if config["dm_extra_owners_and_higher"] else "❌",
                 "inline": True,
             },
+            {
+                "name": _("Specific Channels:"),
+                "value": (
+                    "\n".join(
+                        [
+                            f"- {channel.mention} (`{channel}`)"
+                            for channel_id in config["specific_channels"]
+                            if (channel := guild.get_channel(channel_id)) is not None
+                        ],
+                    )
+                    or _("None")
+                ),
+                "inline": False,
+            },
         ]
 
         components = [ToggleModuleButton(self, guild, view, config["enabled"])]
@@ -143,10 +158,6 @@ class UnauthorizedTextChannelDeletionsModule(Module):
                 channel.id for channel in specific_channels_select.values
             ]
             await self.config_value(guild).specific_channels.set(config["specific_channels"])
-            await interaction.response.send_message(
-                _("✅ Specific channels have been updated."),
-                ephemeral=True,
-            )
             await view.edit_message()
 
         specific_channels_select.callback = specific_channels_callback

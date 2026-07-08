@@ -1,13 +1,15 @@
 import datetime
 import typing
+from collections import defaultdict
 
 import discord
 
-from redbot.core import app_commands
+from redbot.core import app_commands, commands
 from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import box
-from security.constants import Colors, Emojis, get_non_animated_asset
-from security.views import ActionsView, SettingsView, ToggleModuleButton
+from security.constants import Colors, Emojis
+from security.utils import get_non_animated_asset
+from security.views import ActionsView, DurationConverter, SettingsView, ToggleModuleButton
 
 from .module import Module
 
@@ -38,7 +40,12 @@ class ReportsModule(Module):
         "allow_staff_actions": True,
         "channel": None,
         "ping_role": None,
+        "cooldown": "5m",
     }
+
+    def __init__(self, cog: commands.Cog) -> None:
+        super().__init__(cog)
+        self.last_report_at: dict[int, dict[int, datetime.datetime]] = defaultdict(dict)
 
     async def load(self) -> None:
         self.cog.bot.tree.add_command(report_member)
@@ -113,16 +120,59 @@ class ReportsModule(Module):
                 else _("Not set"),
                 "inline": True,
             },
+            {
+                "name": _("Report Cooldown:"),
+                "value": f"`{config['cooldown']}`",
+                "inline": True,
+            },
         ]
 
         components = [ToggleModuleButton(self, guild, view, config["enabled"])]
 
+        create_a_report_channel_button: discord.ui.Button = discord.ui.Button(
+            emoji=Emojis.CHANNEL.value,
+            label=_("Create a Report Channel"),
+            style=discord.ButtonStyle.secondary,
+            disabled=not guild.me.guild_permissions.manage_channels,
+        )
+
+        async def create_a_report_channel_callback(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            channel = await guild.create_text_channel(
+                name=_("{emoji}・reports").format(emoji=Emojis.REPORTS.value),
+                topic=_("This channel is used for reports."),
+                overwrites={
+                    guild.default_role: discord.PermissionOverwrite(
+                        view_channel=False,
+                        send_messages=False,
+                    ),
+                    guild.me: discord.PermissionOverwrite(
+                        view_channel=True,
+                        send_messages=True,
+                        embed_links=True,
+                    ),
+                },
+                reason=_("Created by Security's Reports Module."),
+            )
+            config["channel"] = channel.id
+            await self.config_value(guild).channel.set(channel.id)
+            await interaction.followup.send(
+                _("✅ A new report channel has been created: {channel.mention}.").format(
+                    channel=channel,
+                ),
+                ephemeral=True,
+            )
+            await view.edit_message()
+
+        create_a_report_channel_button.callback = create_a_report_channel_callback
+        components.append(create_a_report_channel_button)
+
         anonymous_button: discord.ui.Button = discord.ui.Button(
+            emoji="🕵️",
             label=_("Anonymous Reporting"),
             style=discord.ButtonStyle.success
             if config["anonymous"]
             else discord.ButtonStyle.danger,
-            emoji="🕵️",
         )
 
         async def anonymous_callback(interaction: discord.Interaction):
@@ -135,11 +185,11 @@ class ReportsModule(Module):
         components.append(anonymous_button)
 
         staff_actions_button: discord.ui.Button = discord.ui.Button(
+            emoji=Emojis.ISSUED_BY.value,
             label=_("Staff Actions"),
             style=discord.ButtonStyle.success
             if config["allow_staff_actions"]
             else discord.ButtonStyle.danger,
-            emoji=Emojis.ISSUED_BY.value,
         )
 
         async def staff_actions_callback(interaction: discord.Interaction):
@@ -151,7 +201,7 @@ class ReportsModule(Module):
         staff_actions_button.callback = staff_actions_callback
         components.append(staff_actions_button)
 
-        channel_select = discord.ui.ChannelSelect(
+        channel_select: discord.ui.ChannelSelect = discord.ui.ChannelSelect(
             channel_types=[discord.ChannelType.text],
             placeholder=_("Select report channel"),
             min_values=0,
@@ -161,18 +211,18 @@ class ReportsModule(Module):
 
         async def channel_callback(interaction: discord.Interaction):
             selected = channel_select.values[0] if channel_select.values else None
-            config["channel"] = selected.id if selected is not None else None
-            await self.config_value(guild).channel.set(config["channel"])
-            await interaction.response.send_message(
-                _("✅ Report channel updated."),
-                ephemeral=True,
-            )
+            if selected is not None:
+                config["channel"] = selected.id
+                await self.config_value(guild).channel.set(selected.id)
+            else:
+                config["channel"] = None
+                await self.config_value(guild).channel.clear()
             await view.edit_message()
 
         channel_select.callback = channel_callback
         components.append(channel_select)
 
-        role_select = discord.ui.RoleSelect(
+        role_select: discord.ui.RoleSelect = discord.ui.RoleSelect(
             placeholder=_("Select ping role"),
             min_values=0,
             max_values=1,
@@ -181,16 +231,29 @@ class ReportsModule(Module):
 
         async def role_callback(interaction: discord.Interaction):
             selected = role_select.values[0] if role_select.values else None
-            config["ping_role"] = selected.id if selected else None
-            await self.config_value(guild).ping_role.set(config["ping_role"])
-            await interaction.response.send_message(
-                _("✅ Ping role updated."),
-                ephemeral=True,
-            )
+            if selected is not None:
+                config["ping_role"] = selected.id
+                await self.config_value(guild).ping_role.set(selected.id)
+            else:
+                config["ping_role"] = None
+                await self.config_value(guild).ping_role.clear()
             await view.edit_message()
 
         role_select.callback = role_callback
         components.append(role_select)
+
+        cooldown_button: discord.ui.Button = discord.ui.Button(
+            label=_("Report Cooldown"),
+            style=discord.ButtonStyle.secondary,
+        )
+
+        async def cooldown_button_callback(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(
+                ConfigureReportCooldownModal(self, guild, view, config["cooldown"]),
+            )
+
+        cooldown_button.callback = cooldown_button_callback
+        components.append(cooldown_button)
 
         return title, description, fields, components
 
@@ -228,7 +291,57 @@ class ReportsModule(Module):
                 ephemeral=True,
             )
             return
+        if (
+            last_report_at := self.last_report_at[interaction.guild.id].get(interaction.user.id)
+        ) is not None:
+            cooldown = await DurationConverter.convert(None, config["cooldown"])
+            retry_at = last_report_at + cooldown
+            if retry_at > datetime.datetime.now(tz=datetime.timezone.utc):
+                await interaction.response.send_message(
+                    _("⏳ You're reporting too often. You can report again {relative}.").format(
+                        relative=discord.utils.format_dt(retry_at, style="R"),
+                    ),
+                    ephemeral=True,
+                )
+                return
         await interaction.response.send_modal(ReasonModal(self, interaction.guild, target))
+
+
+class ConfigureReportCooldownModal(discord.ui.Modal):
+    def __init__(
+        self,
+        module: ReportsModule,
+        guild: discord.Guild,
+        view: SettingsView,
+        cooldown: str,
+    ) -> None:
+        self.module: ReportsModule = module
+        self.guild: discord.Guild = guild
+        self.view: SettingsView = view
+        self.cooldown: str = cooldown
+        super().__init__(title=_("Report Cooldown"))
+        self.cooldown_input: discord.ui.TextInput = discord.ui.TextInput(
+            label=_("Cooldown:"),
+            style=discord.TextStyle.short,
+            default=str(cooldown),
+            required=True,
+        )
+        self.add_item(self.cooldown_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        try:
+            cooldown = self.cooldown_input.value
+            await DurationConverter.convert(None, cooldown)
+        except ValueError as e:
+            await interaction.followup.send(
+                _("Invalid value: {error}").format(error=str(e)),
+                ephemeral=True,
+            )
+            return
+        self.cooldown = cooldown
+        await self.module.config_value(self.guild).cooldown.set(cooldown)
+        await self.view.edit_message()
 
 
 class ReasonModal(discord.ui.Modal):
@@ -329,6 +442,10 @@ class ReasonModal(discord.ui.Modal):
             allowed_mentions=discord.AllowedMentions(roles=True),
         )
         self.module.cog.views[view._message] = view
+        await self.module.cog.record_weekly_stat(self.guild, "report")
+        self.module.last_report_at[self.guild.id][interaction.user.id] = datetime.datetime.now(
+            tz=datetime.timezone.utc,
+        )
         await interaction.followup.send(
             _("Your report has been submitted successfully. Thank you!"),
             ephemeral=True,
